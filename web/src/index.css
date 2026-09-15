@@ -1,0 +1,232 @@
+@import "tailwindcss";
+
+/* dark: 变体由 html.dark 类控制（个别组件做主题特化时使用） */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans:
+    "Microsoft YaHei", "微软雅黑", "PingFang SC", "Hiragino Sans GB", "Segoe UI", system-ui, -apple-system,
+    sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", "Microsoft YaHei", monospace;
+}
+
+/* 主按钮语义色（高对比中性色，亮暗各自定义，不参与色板反转） */
+:root {
+  --app-primary-bg: #e2e8f0;
+  --app-primary-bg-hover: #f8fafc;
+  --app-primary-fg: #0f172a;
+}
+:root:not(.dark) {
+  --app-primary-bg: #1e293b;
+  --app-primary-bg-hover: #0f172a;
+  --app-primary-fg: #f8fafc;
+}
+@theme inline {
+  --color-primary: var(--app-primary-bg);
+  --color-primary-hover: var(--app-primary-bg-hover);
+  --color-primary-fg: var(--app-primary-fg);
+}
+
+/* ==================== 双主题色板 ====================
+   深色主题 = Tailwind 默认色板（html.dark，无需覆盖）。
+   亮色主题 = 在 :root:not(.dark) 上重定义色板变量，实现"视觉反转"：
+
+   - slate 系：950/900 由"最深画布/卡片"反转为"最浅画布/卡片"，
+     800/700 由深边框反转为浅边框，100~400 由亮文字反转为深文字。
+   - 状态色（emerald/rose/amber/blue）：
+     950/900/800（深色 tint 底与边框）→ 浅色 tint（100/200）；
+     300/400（亮色文字）→ 深色文字（700/600）；
+     500/600/700（实色按钮底与 hover 档位）保持不变，保证白字对比度。
+   ==================================================== */
+:root:not(.dark) {
+  color-scheme: light;
+
+  /* slate：画布浅灰 → 卡片白 → 文字由深到浅 */
+  --color-slate-950: #f8fafc;
+  --color-slate-900: #ffffff;
+  --color-slate-800: #e2e8f0;
+  --color-slate-700: #cbd5e1;
+  --color-slate-600: #94a3b8;
+  --color-slate-400: #475569;
+  --color-slate-300: #334155;
+  --color-slate-200: #1e293b;
+  --color-slate-100: #0f172a;
+
+  /* emerald */
+  --color-emerald-100: #064e3b;
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-emerald-400: #059669;
+  --color-emerald-800: #a7f3d0;
+  --color-emerald-900: #a7f3d0;
+  --color-emerald-950: #d1fae5;
+
+  /* rose */
+  --color-rose-100: #881337;
+  --color-rose-200: #9f1239;
+  --color-rose-300: #be123c;
+  --color-rose-400: #e11d48;
+  --color-rose-800: #fecdd3;
+  --color-rose-900: #fecdd3;
+  --color-rose-950: #ffe4e6;
+
+  /* amber */
+  --color-amber-100: #78350f;
+  --color-amber-200: #92400e;
+  --color-amber-300: #b45309;
+  --color-amber-400: #d97706;
+  --color-amber-800: #fde68a;
+  --color-amber-900: #fde68a;
+  --color-amber-950: #fef3c7;
+
+  /* blue */
+  --color-blue-100: #1e3a8a;
+  --color-blue-200: #1e40af;
+  --color-blue-300: #1d4ed8;
+  --color-blue-400: #2563eb;
+  --color-blue-800: #bfdbfe;
+  --color-blue-900: #bfdbfe;
+  --color-blue-950: #dbeafe;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-950 text-slate-200 antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 焦点与选区 ---------- */
+:focus-visible {
+  outline: 2px solid var(--color-blue-500);
+  outline-offset: 1px;
+}
+::selection {
+  background: color-mix(in oklab, var(--color-blue-500) 28%, transparent);
+}
+
+/* ---------- 滚动条（随主题） ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-slate-700) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-slate-700);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-slate-600);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- 动画 ---------- */
+@keyframes event-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.event-in {
+  animation: event-in 0.25s ease-out;
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.slide-in-right {
+  animation: slide-in-right 0.22s ease-out;
+}
+
+/* 三栏拖动中：全局列宽光标并禁用文字选区 */
+body.is-resizing,
+body.is-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .event-in,
+  .slide-up,
+  .slide-in-right {
+    animation: none;
+  }
+}
+
+/* ---------- Monaco Diff 行装饰 ---------- */
+.diff-line-added {
+  background: rgba(34, 197, 94, 0.16) !important;
+}
+.diff-line-removed {
+  background: rgba(244, 63, 94, 0.16) !important;
+}
+.diff-line-hunk {
+  background: rgba(59, 130, 246, 0.12) !important;
+}
+
+/* ---------- React Flow（随主题） ---------- */
+.react-flow__attribution {
+  background: transparent !important;
+}
+.react-flow__attribution a {
+  color: var(--color-slate-500) !important;
+  font-size: 10px;
+}
+.react-flow__controls {
+  box-shadow: none !important;
+}
+.react-flow__controls button {
+  background: var(--color-slate-900) !important;
+  border-bottom: 1px solid var(--color-slate-800) !important;
+  color: var(--color-slate-400) !important;
+  fill: var(--color-slate-400) !important;
+}
+.react-flow__controls button:hover {
+  background: var(--color-slate-800) !important;
+}
+.react-flow__edge-path {
+  stroke: var(--color-slate-700);
+  stroke-width: 1.6;
+}
+.react-flow__edge.selected .react-flow__edge-path,
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: #3b82f6;
+}

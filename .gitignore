@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- Env / secrets ---
+.env
+*.local
+
+# --- Runtime data ---
+data/
+*.db
+*.sqlite3
+
+# --- Test / tooling ---
+.pytest_cache/
+.pytest_tmp/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local debug artifacts（AGENTS.md 约定：可随时删除，无需提交） ---
+/_*.log
+/_*.py
+/_*.txt
+/_*.png
+/_*.ps1
+/ee-*.png
+/*-page.png
+/*-panel.png
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- Client (V2) ---
+client/node_modules/
+client/dist/
+client/src-tauri/target/

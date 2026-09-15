@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeguild"
+version = "0.1.0"
+description = "CodeGuild - 多 Agent 软件开发系统（LangGraph + Agent Harness + Code RAG）"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "langgraph>=0.2,<2",
+    "langgraph-checkpoint-sqlite>=2.0,<4",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "openai>=1.40",
+    "anthropic>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+postgres = [
+    "asyncpg>=0.29",
+    "langgraph-checkpoint-postgres>=2.0",
+]
+
+[project.scripts]
+codeguild = "app.cli:main"
+# 兼容旧命令（历史脚本/文档中的 ma-dev 仍可直接使用）
+ma-dev = "app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --basetemp=.pytest_tmp"
+filterwarnings = ["ignore::DeprecationWarning"]
