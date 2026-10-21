@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import uuid
 from enum import Enum
-from typing import Any, Optional, TypedDict
+from typing import Annotated, Any, Optional, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -46,9 +46,26 @@ class TaskRecord(BaseModel):
     assigned_agent: Optional[str] = None
     priority: str = "high"
     acceptance_criteria: list[str] = Field(default_factory=list)
+    target_files: list[str] = Field(default_factory=list)
     attempts: int = 0
     result_summary: str = ""
     error: str = ""
+
+
+def merge_task_results(left: list[dict] | None, right: list[dict] | None) -> list[dict]:
+    """合并并行 Worker 结果，并让节点 replay 原位替换同一任务结果。"""
+    merged: list[dict] = []
+    positions: dict[tuple[str, str], int] = {}
+    for item in [*(left or []), *(right or [])]:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("batch_id") or ""), str(item.get("task_id") or ""))
+        if key in positions:
+            merged[positions[key]] = dict(item)
+        else:
+            positions[key] = len(merged)
+            merged.append(dict(item))
+    return merged
 
 
 class DevState(TypedDict, total=False):
@@ -92,6 +109,7 @@ class DevState(TypedDict, total=False):
     plan_recorded: bool
     active_task_id: str  # 当前正在编码的任务
     pending_approvals: list  # 等待人工审批的工具调用
+    coding_results: Annotated[list[dict], merge_task_results]  # 并行 Worker 的幂等结果集合
     approval: dict  # 人工审批结果
     validation: dict  # 最近一次验证结果（编码子图内）
     final_report: dict  # Final Review 汇总
@@ -138,6 +156,7 @@ def empty_dev_state(project_id: str, run_id: str, user_request: str) -> DevState
         plan_recorded=False,
         active_task_id="",
         pending_approvals=[],
+        coding_results=[],
         approval={},
         validation={},
         final_report={},

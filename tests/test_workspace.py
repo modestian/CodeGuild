@@ -13,7 +13,9 @@ import json
 from pathlib import Path
 
 from app.config import Settings
+from app.schemas.state import TaskRecord
 from app.services.app_context import AppContext
+from app.storage import repositories as repo
 from app.tools.common import run_host_git
 from app.workspace.manager import WorkspaceManager
 
@@ -223,3 +225,20 @@ class TestMockScriptsFile:
             assert ctx._llm_scripts == {}
         finally:
             await ctx.close()
+
+
+class TestTaskPersistence:
+    async def test_target_files_round_trip_through_task_repository(self, app_ctx):
+        async with app_ctx.database.session() as session:
+            project = await repo.create_project(session, name="p", repo_path="C:/repo")
+            run = await repo.create_run(session, project.id, "request")
+            await repo.sync_tasks(
+                session,
+                run.id,
+                [TaskRecord(id="T1", title="API", target_files=["app/api.py"])],
+            )
+
+        async with app_ctx.database.session() as session:
+            rows = await repo.list_tasks(session, run.id)
+
+        assert list(rows[0].target_files) == ["app/api.py"]
