@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import pytest
 
+from app.config import Settings
+from app.schemas import state as state_schema
 from app.schemas.state import (
     DevState,
     TaskDAGError,
@@ -80,3 +82,47 @@ class TestDevState:
         ):
             assert key in state
         assert state["run_status"] == "created"
+
+
+class TestParallelCodingContracts:
+    def test_parallel_settings_have_safe_defaults(self):
+        settings = Settings(_env_file=None)
+
+        assert settings.parallel_coding_enabled is True
+        assert settings.max_parallel_coders == 2
+        assert settings.parallel_interactive_approval_enabled is False
+
+    def test_task_record_retains_target_files(self):
+        task = TaskRecord(
+            id="T1",
+            title="API",
+            target_files=["app/api/users.py", "tests/test_users.py"],
+        )
+
+        assert task.target_files == ["app/api/users.py", "tests/test_users.py"]
+
+    def test_task_result_reducer_replaces_replayed_result_in_place(self):
+        merge = getattr(state_schema, "merge_task_results", None)
+        assert callable(merge)
+        first = [
+            {"batch_id": "batch-1", "task_id": "T1", "status": "failed"},
+            {"batch_id": "batch-1", "task_id": "T2", "status": "done"},
+        ]
+        replay = [{"batch_id": "batch-1", "task_id": "T1", "status": "done"}]
+
+        assert merge(first, replay) == [
+            {"batch_id": "batch-1", "task_id": "T1", "status": "done"},
+            {"batch_id": "batch-1", "task_id": "T2", "status": "done"},
+        ]
+
+    def test_task_result_reducer_keeps_distinct_batches(self):
+        merge = getattr(state_schema, "merge_task_results", None)
+        assert callable(merge)
+
+        assert merge(
+            [{"batch_id": "batch-1", "task_id": "T1", "status": "done"}],
+            [{"batch_id": "batch-2", "task_id": "T1", "status": "done"}],
+        ) == [
+            {"batch_id": "batch-1", "task_id": "T1", "status": "done"},
+            {"batch_id": "batch-2", "task_id": "T1", "status": "done"},
+        ]

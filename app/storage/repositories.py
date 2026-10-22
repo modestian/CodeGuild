@@ -94,6 +94,7 @@ async def create_tasks(session, run_id: str, tasks: list[TaskRecord]) -> None:
                 assigned_agent=t.assigned_agent,
                 priority=t.priority,
                 acceptance_criteria=list(t.acceptance_criteria),
+                target_files=list(t.target_files),
                 attempts=t.attempts,
                 result_summary=t.result_summary,
                 error=t.error,
@@ -117,6 +118,7 @@ async def upsert_task(session, run_id: str, task: TaskRecord) -> None:
     row.assigned_agent = task.assigned_agent
     row.priority = task.priority
     row.acceptance_criteria = list(task.acceptance_criteria)
+    row.target_files = list(task.target_files)
     row.attempts = task.attempts
     row.result_summary = task.result_summary
     row.error = task.error

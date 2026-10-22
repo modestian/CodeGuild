@@ -43,6 +43,8 @@ def route_after_validation(state: dict) -> str:
 # Development SubGraph 路由
 DEV_ROUTES = {
     "code": "code_task",
+    "serial_code": "serial_code",
+    "integrate": "integration",
     "test": "testing",
     "review": "review",
     "repair": "repair",
@@ -60,6 +62,11 @@ def route_after_scheduler(state: dict) -> str:
 def route_after_finalize(state: dict) -> str:
     scratch = state.get("scratch") or {}
     return scratch.get("finalize_route") or "blocked"
+
+
+def route_after_integration(state: dict) -> str:
+    scratch = state.get("scratch") or {}
+    return scratch.get("integration_route") or "blocked"
 
 
 def route_after_repair(state: dict) -> str:

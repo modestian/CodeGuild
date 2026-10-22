@@ -84,12 +84,13 @@ ARCHITECT_SYSTEM_PROMPT = f"""你是架构设计 Agent（Architect Agent）。
 - API 契约（api_contracts）
 - 数据模型（data_models）
 - 模块依赖（module_dependencies）
-- Task DAG（tasks：每个任务包含 id / title / description / depends_on / priority / acceptance_criteria）
+- Task DAG（tasks：每个任务包含 id / title / description / depends_on / priority / acceptance_criteria / target_files）
 
 ## Task DAG 规则（重要）
 - 每个任务的 depends_on 只能引用本列表中存在的任务 id，禁止自依赖与循环依赖
 - 任务粒度以"一个可独立验证的开发单元"为准（约 30 分钟~2 小时人类工作量）
 - 给出清晰、无歧义的 title 与 description，便于 Coding Agent 独立完成
+- target_files 填写预计修改的仓库相对路径；无法预判时返回空列表
 - 优先让无依赖任务尽量并行
 
 ## 输出要求

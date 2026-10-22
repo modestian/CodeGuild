@@ -13,7 +13,9 @@ import json
 from pathlib import Path
 
 from app.config import Settings
+from app.schemas.state import TaskRecord
 from app.services.app_context import AppContext
+from app.storage import repositories as repo
 from app.tools.common import run_host_git
 from app.workspace.manager import WorkspaceManager
 
@@ -223,3 +225,138 @@ class TestMockScriptsFile:
             assert ctx._llm_scripts == {}
         finally:
             await ctx.close()
+
+
+class TestTaskPersistence:
+    async def test_target_files_round_trip_through_task_repository(self, app_ctx):
+        async with app_ctx.database.session() as session:
+            project = await repo.create_project(session, name="p", repo_path="C:/repo")
+            run = await repo.create_run(session, project.id, "request")
+            await repo.sync_tasks(
+                session,
+                run.id,
+                [TaskRecord(id="T1", title="API", target_files=["app/api.py"])],
+            )
+
+        async with app_ctx.database.session() as session:
+            rows = await repo.list_tasks(session, run.id)
+
+        assert list(rows[0].target_files) == ["app/api.py"]
+
+
+class TestTaskWorkspaces:
+    @staticmethod
+    def _manager(tmp_path) -> WorkspaceManager:
+        settings = Settings(
+            _env_file=None,
+            data_dir=tmp_path / "data",
+            database_url=f"sqlite+aiosqlite:///{(tmp_path / 'data' / 'db.sqlite').as_posix()}",
+            llm_provider="mock",
+            sandbox_mode="local",
+        )
+        settings.ensure_dirs()
+        return WorkspaceManager(settings)
+
+    async def test_task_worktrees_are_isolated_and_replayed_by_identity(self, tmp_path, sample_repo):
+        manager = self._manager(tmp_path)
+        run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run123456789")
+        run_path = Path(run.path)
+
+        first = await manager.create_task_workspace(
+            run_path, run.branch, "run123456789", "batch-a", "T1"
+        )
+        second = await manager.create_task_workspace(
+            run_path, run.branch, "run123456789", "batch-a", "T2"
+        )
+        replay = await manager.create_task_workspace(
+            run_path, run.branch, "run123456789", "batch-a", "T1"
+        )
+
+        assert Path(first.path).is_absolute()
+        assert Path(first.path) != Path(second.path)
+        assert first.branch != second.branch
+        assert replay.path == first.path and replay.branch == first.branch
+
+        first_file = Path(first.path) / "only-first.txt"
+        first_file.write_text("first\n", encoding="utf-8")
+        assert not (Path(second.path) / "only-first.txt").exists()
+        assert not (run_path / "only-first.txt").exists()
+
+        await manager.cleanup_task_workspace(run_path, Path(first.path))
+        await manager.cleanup_task_workspace(run_path, Path(second.path))
+        await manager.cleanup(str(sample_repo), run_path)
+
+    async def test_distinct_task_ids_with_same_slug_get_distinct_worktrees(
+        self, tmp_path, sample_repo
+    ):
+        manager = self._manager(tmp_path)
+        run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run133456789")
+        run_path = Path(run.path)
+
+        first = await manager.create_task_workspace(
+            run_path, run.branch, "run133456789", "batch-a", "API/Auth"
+        )
+        second = await manager.create_task_workspace(
+            run_path, run.branch, "run133456789", "batch-a", "API Auth"
+        )
+
+        try:
+            assert first.path != second.path
+            assert first.branch != second.branch
+        finally:
+            await manager.cleanup_task_workspace(run_path, Path(first.path))
+            await manager.cleanup_task_workspace(run_path, Path(second.path))
+            await manager.cleanup(str(sample_repo), run_path)
+
+    async def test_task_commit_integrates_once(self, tmp_path, sample_repo):
+        manager = self._manager(tmp_path)
+        run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run223456789")
+        run_path = Path(run.path)
+        task = await manager.create_task_workspace(
+            run_path, run.branch, "run223456789", "batch-a", "T1"
+        )
+        task_path = Path(task.path)
+        (task_path / "task-one.txt").write_text("done\n", encoding="utf-8")
+
+        commit = await manager.commit_task_workspace(task_path, "T1", "add task one")
+        first = await manager.integrate_task_commit(run_path, commit["sha"], "T1")
+        replay = await manager.integrate_task_commit(run_path, commit["sha"], "T1")
+
+        assert first["integrated"] is True and first["already_integrated"] is False
+        assert replay["integrated"] is True and replay["already_integrated"] is True
+        assert (run_path / "task-one.txt").read_text(encoding="utf-8") == "done\n"
+
+        await manager.cleanup_task_workspace(run_path, task_path)
+        await manager.cleanup(str(sample_repo), run_path)
+
+    async def test_conflicting_task_commit_aborts_without_overwriting_run(self, tmp_path, sample_repo):
+        manager = self._manager(tmp_path)
+        run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run323456789")
+        run_path = Path(run.path)
+        first = await manager.create_task_workspace(
+            run_path, run.branch, "run323456789", "batch-a", "T1"
+        )
+        second = await manager.create_task_workspace(
+            run_path, run.branch, "run323456789", "batch-a", "T2"
+        )
+        first_core = Path(first.path) / "noteapp" / "core.py"
+        second_core = Path(second.path) / "noteapp" / "core.py"
+        first_core.write_text(first_core.read_text(encoding="utf-8").replace("return list(self._notes)", "return tuple(self._notes)"), encoding="utf-8")
+        second_core.write_text(second_core.read_text(encoding="utf-8").replace("return list(self._notes)", "return self._notes.copy()"), encoding="utf-8")
+
+        first_commit = await manager.commit_task_workspace(Path(first.path), "T1", "tuple result")
+        second_commit = await manager.commit_task_workspace(Path(second.path), "T2", "copy result")
+        assert (await manager.integrate_task_commit(run_path, first_commit["sha"], "T1"))["integrated"] is True
+
+        conflict = await manager.integrate_task_commit(run_path, second_commit["sha"], "T2")
+
+        assert conflict["integrated"] is False
+        assert conflict["conflict"] is True
+        assert conflict["conflict_files"] == ["noteapp/core.py"]
+        assert "return tuple(self._notes)" in (run_path / "noteapp" / "core.py").read_text(encoding="utf-8")
+        code, out, _ = await run_host_git(run_path, ["status", "--porcelain"])
+        assert code == 0 and out.strip() == ""
+
+        await manager.cleanup_task_workspace(run_path, Path(first.path))
+        await manager.cleanup_task_workspace(run_path, Path(second.path))
+        await manager.cleanup(str(sample_repo), run_path)

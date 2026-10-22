@@ -329,7 +329,10 @@ def build_main_graph(app: AppContext, checkpointer=None):
             f"Tasks: {', '.join(done) or '(none)'}\n"
         )
         try:
-            result = await app.workspaces.commit(workspace, message)
+            # Parallel task commits have already been cherry-picked into the Run
+            # branch. Keep the approval as an auditable delivery marker even when
+            # there are no remaining unstaged changes.
+            result = await app.workspaces.commit(workspace, message, allow_empty=True)
             await app.tracer.emit(
                 state["run_id"],
                 EventType.COMMIT_DONE,

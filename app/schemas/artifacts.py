@@ -95,6 +95,7 @@ class TaskItem(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     priority: str = "high"
     acceptance_criteria: list[str] = Field(default_factory=list)
+    target_files: list[str] = Field(default_factory=list)
 
 
 class Architecture(BaseModel):

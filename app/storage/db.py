@@ -41,6 +41,7 @@ class Database:
             ("runs", "approval_mode", "approval_mode VARCHAR(16) DEFAULT 'auto'"),
             ("approvals", "scope", "scope VARCHAR(16) DEFAULT 'once'"),
             ("approvals", "consumed", "consumed BOOLEAN DEFAULT 0"),
+            ("tasks", "target_files", "target_files JSON DEFAULT '[]'"),
         ]
         async with self.engine.begin() as conn:
             for table, column, ddl in wanted_columns:

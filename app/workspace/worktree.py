@@ -42,6 +42,17 @@ async def has_commits(path: Path) -> bool:
     return code == 0
 
 
+async def commit_already_applied(repo: Path, commit_sha: str) -> bool:
+    """判断提交本身或其等价补丁是否已存在于当前 HEAD。"""
+    code, _, _ = await run_host_git(repo, ["merge-base", "--is-ancestor", commit_sha, "HEAD"])
+    if code == 0:
+        return True
+    code, out, _ = await run_host_git(repo, ["cherry", "HEAD", commit_sha])
+    if code != 0:
+        return False
+    return any(line.strip() == f"- {commit_sha}" for line in out.splitlines())
+
+
 async def add_worktree(repo: Path, worktree_path: Path, branch: str, base: str | None = None) -> None:
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
     args = ["worktree", "add", "-b", branch, str(worktree_path)]

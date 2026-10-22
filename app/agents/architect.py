@@ -76,6 +76,7 @@ async def run_architect(app: AppContext, state: dict) -> dict:
                     dependencies=list(item.get("depends_on") or []),
                     priority=item.get("priority", "high"),
                     acceptance_criteria=list(item.get("acceptance_criteria") or []),
+                    target_files=list(item.get("target_files") or []),
                 )
                 for item in (candidate.get("tasks") or [])
             ]
@@ -110,6 +111,7 @@ async def run_architect(app: AppContext, state: dict) -> dict:
             dependencies=list(item.get("depends_on") or []),
             priority=item.get("priority", "high"),
             acceptance_criteria=list(item.get("acceptance_criteria") or []),
+            target_files=list(item.get("target_files") or []),
         )
         for item in architecture.get("tasks") or []
     ]

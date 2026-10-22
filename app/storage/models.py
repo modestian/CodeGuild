@@ -78,6 +78,7 @@ class TaskRow(Base):
     assigned_agent: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     priority: Mapped[str] = mapped_column(String(16), default="high")
     acceptance_criteria: Mapped[list] = mapped_column(JSON, default=list)
+    target_files: Mapped[list] = mapped_column(JSON, default=list)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     result_summary: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str] = mapped_column(Text, default="")

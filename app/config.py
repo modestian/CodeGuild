@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     max_review_retry: int = 3
     max_plan_retry: int = 2
 
+    # ---------- 并行 Coding 调度 ----------
+    parallel_coding_enabled: bool = True
+    max_parallel_coders: int = Field(default=2, ge=1)
+    # 多 interrupt 审批队列完成前，interactive 模式保持串行。
+    parallel_interactive_approval_enabled: bool = False
+
     # ---------- Supervisor（FR-SUP-08：MVP fixed，V2 dynamic） ----------
     supervisor_mode: str = "fixed"  # fixed | dynamic
 

@@ -24,6 +24,7 @@ data/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+.worktrees/
 
 # --- Local debug artifacts（AGENTS.md 约定：可随时删除，无需提交） ---
 /_*.log
