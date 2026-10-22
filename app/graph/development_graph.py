@@ -37,7 +37,15 @@ from app.graph.routing import (
 )
 from app.graph.safe_point import pause_safe_point
 from app.schemas.events import EventType
-from app.schemas.state import DevState, TaskRecord, TaskStatus, compute_ready_tasks, propagate_blocking, topological_order
+from app.schemas.state import (
+    DevState,
+    TaskDAGError,
+    TaskRecord,
+    TaskStatus,
+    compute_ready_tasks,
+    propagate_blocking,
+    topological_order,
+)
 from app.services.app_context import AppContext
 from app.storage import repositories as repo
 
@@ -88,6 +96,36 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
         """Adapter used by deterministic test doubles that only expose ainvoke()."""
         return await coding_worker.ainvoke(state)
 
+    async def invalid_dag_updates(
+        state: dict,
+        tasks: list[TaskRecord],
+        scratch: dict,
+        *,
+        agent: str,
+        route_key: str,
+        error: TaskDAGError,
+    ) -> dict:
+        """Convert invalid/cyclic checkpoint state into a diagnosable safe stop."""
+        reason = f"Task DAG 校验失败，无法继续调度: {error}"
+        scratch[route_key] = "blocked"
+        scratch["dev_stage"] = "blocked"
+        await app.tracer.emit(
+            state["run_id"],
+            EventType.ERROR,
+            reason,
+            agent=agent,
+            data={"reason": "invalid_task_dag", "detail": str(error)},
+        )
+        return {
+            "task_dag": dump_tasks(tasks),
+            "ready_tasks": [],
+            "needs_human": True,
+            "fail_reason": reason,
+            "errors": merged_errors(state, make_error(agent, reason)),
+            "current_agent": agent,
+            "scratch": scratch,
+        }
+
     # =====================================================
     # Task Scheduler
     # =====================================================
@@ -108,7 +146,17 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
 
         ready = compute_ready_tasks(tasks)
         by_id = {t.id: t for t in tasks}
-        topo = topological_order(tasks)
+        try:
+            topo = topological_order(tasks)
+        except TaskDAGError as exc:
+            return await invalid_dag_updates(
+                state,
+                tasks,
+                scratch,
+                agent="task_scheduler",
+                route_key="dev_stage",
+                error=exc,
+            )
         ordered_ready = [tid for tid in topo if tid in ready]
         newly_ready: list[str] = []
         for tid in ready:
@@ -284,12 +332,22 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
             for item in (state.get("coding_results") or [])
             if isinstance(item, dict) and str(item.get("batch_id") or "") == batch_id
         }
-        topo = topological_order(tasks)
+        scratch = dict(state.get("scratch") or {})
+        try:
+            topo = topological_order(tasks)
+        except TaskDAGError as exc:
+            return await invalid_dag_updates(
+                state,
+                tasks,
+                scratch,
+                agent="integration",
+                route_key="integration_route",
+                error=exc,
+            )
         ordered = [task_id for task_id in topo if task_id in current_tasks]
         completed = list(state.get("completed_tasks") or [])
         changed_files = list(state.get("changed_files") or [])
         integration_results: list[dict] = []
-        scratch = dict(state.get("scratch") or {})
         task_feedback = dict(scratch.get("task_feedback") or {})
         retry_count = int(state.get("retry_count") or 0)
         terminal_failures: list[TaskRecord] = []
@@ -499,7 +557,17 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
         scratch = dict(state.get("scratch") or {})
         stage = scratch.get("repair_from") or "code"
         active_id = scratch.get("active_task_id") or state.get("active_task_id") or ""
-        topo = topological_order(tasks)
+        try:
+            topo = topological_order(tasks)
+        except TaskDAGError as exc:
+            return await invalid_dag_updates(
+                state,
+                tasks,
+                scratch,
+                agent="repair",
+                route_key="repair_route",
+                error=exc,
+            )
         target = next((t for t in tasks if t.id == active_id), None)
         if target is None:
             # 未指定修复目标：选择拓扑序最后一个已完成任务
