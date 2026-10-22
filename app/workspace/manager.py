@@ -27,6 +27,12 @@ class WorkspaceInfo(BaseModel):
     repo_path: str
 
 
+class TaskWorkspaceInfo(WorkspaceInfo):
+    run_id: str
+    batch_id: str
+    task_id: str
+
+
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower()
     return slug or "project"
@@ -123,6 +129,129 @@ class WorkspaceManager:
             else:
                 raise WorkspaceError(str(exc)) from exc
         return WorkspaceInfo(path=str(ws_path), branch=branch, repo_path=str(repo))
+
+    async def create_task_workspace(
+        self,
+        run_workspace: Path,
+        run_branch: str,
+        run_id: str,
+        batch_id: str,
+        task_id: str,
+    ) -> TaskWorkspaceInfo:
+        """为 Coding 任务创建或复用隔离 worktree；相同身份调用保持幂等。"""
+        run_workspace = run_workspace.resolve()
+        if not await worktree.is_git_repo(run_workspace):
+            raise WorkspaceError(f"Run 工作区不是 Git 仓库根目录: {run_workspace}")
+
+        root = self.settings.workspaces_dir.resolve()
+        task_slug = _slugify(task_id)
+        batch_slug = _slugify(batch_id)[:16]
+        run_slug = _slugify(run_id)[:12]
+        task_root = (root / f"{run_workspace.name}-tasks").resolve()
+        ws_path = (task_root / f"{task_slug}-{batch_slug}").resolve()
+        if not ws_path.is_relative_to(root):
+            raise WorkspaceError(f"任务工作区越界: {ws_path}")
+
+        # Git ref 不能同时存在 `agent/run-x` 和 `agent/run-x/...`，因此任务
+        # 分支使用同级命名，而不是挂在 Run 分支 ref 下。
+        branch = f"agent/task-{run_slug}-{task_slug}-{batch_slug}"
+        if ws_path.exists():
+            existing_branch = await worktree.head_branch(ws_path)
+            if existing_branch == branch:
+                return TaskWorkspaceInfo(
+                    path=str(ws_path),
+                    branch=branch,
+                    repo_path=str(run_workspace),
+                    run_id=run_id,
+                    batch_id=batch_id,
+                    task_id=task_id,
+                )
+            raise WorkspaceError(f"任务工作区已存在但分支不匹配: {ws_path} ({existing_branch})")
+
+        try:
+            await worktree.add_worktree(run_workspace, ws_path, branch, base=run_branch or "HEAD")
+        except RuntimeError as exc:
+            if "already exists" not in str(exc):
+                raise WorkspaceError(str(exc)) from exc
+            code, out, err = await run_host_git(
+                run_workspace, ["worktree", "add", str(ws_path), branch], timeout=120
+            )
+            if code != 0:
+                raise WorkspaceError(f"恢复任务 worktree 失败: {(err or out).strip()[:500]}") from exc
+
+        return TaskWorkspaceInfo(
+            path=str(ws_path),
+            branch=branch,
+            repo_path=str(run_workspace),
+            run_id=run_id,
+            batch_id=batch_id,
+            task_id=task_id,
+        )
+
+    async def commit_task_workspace(
+        self, task_workspace: Path, task_id: str, summary: str = ""
+    ) -> dict[str, str]:
+        """提交任务工作区；节点 replay 时复用已存在的任务提交。"""
+        task_workspace = task_workspace.resolve()
+        changed = await self.changed_files(task_workspace)
+        message = f"feat({task_id}): {summary.strip() or 'complete coding task'}"
+        if changed:
+            await self.commit(task_workspace, message)
+        code, sha, err = await run_host_git(task_workspace, ["rev-parse", "HEAD"])
+        if code != 0 or not sha.strip():
+            raise WorkspaceError(f"读取任务提交失败: {(err or sha).strip()[:300]}")
+        return {"sha": sha.strip(), "message": message, "reused": str(not changed).lower()}
+
+    async def integrate_task_commit(
+        self, run_workspace: Path, commit_sha: str, task_id: str
+    ) -> dict[str, object]:
+        """将任务提交幂等地集成到 Run 分支，冲突时恢复干净状态。"""
+        run_workspace = run_workspace.resolve()
+        code, _, err = await run_host_git(
+            run_workspace, ["cat-file", "-e", f"{commit_sha}^{{commit}}"]
+        )
+        if code != 0:
+            raise WorkspaceError(f"任务 {task_id} 提交不存在: {(err or commit_sha).strip()[:300]}")
+
+        if await worktree.commit_already_applied(run_workspace, commit_sha):
+            return {
+                "task_id": task_id,
+                "commit_sha": commit_sha,
+                "integrated": True,
+                "already_integrated": True,
+                "conflict": False,
+                "conflict_files": [],
+            }
+
+        code, out, err = await run_host_git(
+            run_workspace, ["cherry-pick", commit_sha], timeout=120
+        )
+        if code == 0:
+            return {
+                "task_id": task_id,
+                "commit_sha": commit_sha,
+                "integrated": True,
+                "already_integrated": False,
+                "conflict": False,
+                "conflict_files": [],
+            }
+
+        _, conflicts, _ = await run_host_git(
+            run_workspace, ["diff", "--name-only", "--diff-filter=U"]
+        )
+        await run_host_git(run_workspace, ["cherry-pick", "--abort"], timeout=60)
+        return {
+            "task_id": task_id,
+            "commit_sha": commit_sha,
+            "integrated": False,
+            "already_integrated": False,
+            "conflict": True,
+            "conflict_files": [line.strip() for line in conflicts.splitlines() if line.strip()],
+            "error": (err or out).strip()[:1000],
+        }
+
+    async def cleanup_task_workspace(self, run_workspace: Path, task_workspace: Path) -> None:
+        await worktree.remove_worktree(run_workspace.resolve(), task_workspace.resolve(), force=True)
 
     async def full_diff(self, workspace: Path, max_chars: int = 200_000, stat_only: bool = False) -> str:
         """完整变更 diff：
