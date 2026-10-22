@@ -32,6 +32,7 @@ const AGENT_NAMES: Record<string, string> = {
   human: '你（人工）',
   human_approval: '人工审批',
   task_scheduler: '任务调度',
+  integration: '任务集成',
   repair: '修复',
   commit: '提交',
   system: '系统',
@@ -116,6 +117,55 @@ export function narrate(ev: RunEvent): Narrative | null {
       return { ...base, kind: 'task', title: `完成任务：${str(d.title || d.task || ev.message)}`, detail: str(d.result || d.summary) }
     case 'task_failed':
       return { ...base, kind: 'problem', title: `任务失败：${str(d.title || d.task || ev.message)}`, detail: str(d.error || d.reason) }
+    case 'batch_scheduled': {
+      const taskIds = Array.isArray(d.task_ids) ? d.task_ids.map(String).filter(Boolean) : []
+      const mode = d.parallel === true ? '并行' : '串行'
+      return {
+        ...base,
+        kind: 'task',
+        title: `已${mode}调度 Coding 批次${taskIds.length ? `（${taskIds.length} 个任务）` : ''}`,
+        detail: taskIds.length ? taskIds.join('、') : str(d.batch_id || ev.message),
+      }
+    }
+    case 'task_workspace_created':
+      return {
+        ...base,
+        kind: 'evidence',
+        title: `已为任务 ${str(d.task_id || '') || 'Coding'} 创建隔离工作区`,
+        detail: str(d.branch || d.batch_id || ev.message),
+      }
+    case 'integration_started': {
+      const taskIds = Array.isArray(d.task_ids) ? d.task_ids.map(String).filter(Boolean) : []
+      return {
+        ...base,
+        kind: 'task',
+        title: '开始按确定顺序集成本批任务',
+        detail: taskIds.length ? taskIds.join('、') : str(d.batch_id || ev.message),
+      }
+    }
+    case 'task_integrated':
+      return {
+        ...base,
+        kind: 'evidence',
+        title: `任务 ${str(d.task_id || '') || ''} 已集成到 Run 分支`.trim(),
+        detail: str(d.commit_sha || d.batch_id || ev.message),
+      }
+    case 'integration_conflict': {
+      const files = Array.isArray(d.conflict_files) ? d.conflict_files.map(String).filter(Boolean) : []
+      return {
+        ...base,
+        kind: 'problem',
+        title: `任务 ${str(d.task_id || '') || ''} 集成时发生冲突`.trim(),
+        detail: files.length ? files.join('、') : str(d.error || ev.message),
+      }
+    }
+    case 'batch_completed':
+      return {
+        ...base,
+        kind: 'milestone',
+        title: 'Coding 批次已完成',
+        detail: str(d.batch_id || ev.message),
+      }
     case 'agent_started':
       return { ...base, kind: 'task', title: `${agentDisplayName(agent)}开始工作`, detail: str(d.task || d.brief) }
     case 'agent_finished':
