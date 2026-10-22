@@ -187,10 +187,16 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
             )
         elif blocked_left:
             scratch["dev_stage"] = "blocked"
-            names = ", ".join(f"{t.id}({t.status.value})" for t in blocked_left[:8])
-            updates["needs_human"] = True
-            updates["fail_reason"] = f"任务阻塞/失败且无法继续: {names}"
-            updates["errors"] = merged_errors(state, make_error("scheduler", updates["fail_reason"]))
+            if state.get("needs_human") and state.get("fail_reason"):
+                updates["needs_human"] = True
+                updates["fail_reason"] = str(state["fail_reason"])
+            else:
+                names = ", ".join(f"{t.id}({t.status.value})" for t in blocked_left[:8])
+                updates["needs_human"] = True
+                updates["fail_reason"] = f"任务阻塞/失败且无法继续: {names}"
+                updates["errors"] = merged_errors(
+                    state, make_error("scheduler", updates["fail_reason"])
+                )
         else:
             scratch["dev_stage"] = "blocked"
             updates["needs_human"] = True
@@ -222,6 +228,7 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
     async def code_task_node(state: dict) -> dict:
         """在隔离状态/工作区运行 Coding SubGraph，仅向父图追加任务结果。"""
         task_id = str(state.get("active_task_id") or "")
+        worker_state: dict | None = None
         try:
             worker_state = await coding_worker.ainvoke(state)
             result = task_result_from_state(worker_state)
@@ -231,6 +238,27 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
                 )
                 result["commit_sha"] = commit["sha"]
         except Exception as exc:  # noqa: BLE001 — 单 Worker 失败必须转换为批次结果
+            source_state = worker_state or state
+            task = next(
+                (
+                    dict(item)
+                    for item in (source_state.get("task_dag") or [])
+                    if isinstance(item, dict) and item.get("id") == task_id
+                ),
+                {},
+            )
+            input_task = next(
+                (
+                    item
+                    for item in (state.get("task_dag") or [])
+                    if isinstance(item, dict) and item.get("id") == task_id
+                ),
+                {},
+            )
+            task["attempts"] = max(
+                int(task.get("attempts") or 0),
+                int(input_task.get("attempts") or 0) + 1,
+            )
             result = {
                 "batch_id": str((state.get("scratch") or {}).get("batch_id") or ""),
                 "task_id": task_id,
@@ -239,14 +267,7 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
                 "error": str(exc)[:1000],
                 "changed_files": [],
                 "validation": {},
-                "task": next(
-                    (
-                        dict(item)
-                        for item in (state.get("task_dag") or [])
-                        if isinstance(item, dict) and item.get("id") == task_id
-                    ),
-                    {},
-                ),
+                "task": task,
             }
         result["workspace_path"] = str(state.get("workspace_path") or "")
         result["branch"] = str(state.get("branch") or "")
@@ -368,7 +389,10 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
             await repo.sync_tasks(session_db, state["run_id"], tasks)
         scratch["task_feedback"] = task_feedback
         scratch["dispatches"] = []
-        scratch["integration_route"] = "blocked" if terminal_failures else "schedule"
+        # Return to the scheduler even after a terminal task failure so other
+        # independent READY tasks outside this batch can still finish. The
+        # scheduler stops only once no runnable work remains.
+        scratch["integration_route"] = "schedule"
         scratch["dev_stage"] = scratch["integration_route"]
         await app.tracer.emit(
             state["run_id"],
@@ -505,7 +529,11 @@ def build_development_graph(app: AppContext, coding_graph: Any | None = None):
             return updates
 
         target.status = TaskStatus.READY
-        scratch["feedback"] = _compose_feedback(state, stage)
+        feedback = _compose_feedback(state, stage)
+        scratch["feedback"] = feedback
+        task_feedback = dict(scratch.get("task_feedback") or {})
+        task_feedback[target.id] = feedback
+        scratch["task_feedback"] = task_feedback
         scratch["repair_route"] = "schedule"
         scratch["dev_stage"] = "schedule"
         scratch["active_task_id"] = target.id

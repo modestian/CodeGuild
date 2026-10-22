@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Optional
@@ -144,17 +145,18 @@ class WorkspaceManager:
             raise WorkspaceError(f"Run 工作区不是 Git 仓库根目录: {run_workspace}")
 
         root = self.settings.workspaces_dir.resolve()
-        task_slug = _slugify(task_id)
+        task_slug = _slugify(task_id)[:48]
+        task_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:8]
         batch_slug = _slugify(batch_id)[:16]
         run_slug = _slugify(run_id)[:12]
         task_root = (root / f"{run_workspace.name}-tasks").resolve()
-        ws_path = (task_root / f"{task_slug}-{batch_slug}").resolve()
+        ws_path = (task_root / f"{task_slug}-{task_key}-{batch_slug}").resolve()
         if not ws_path.is_relative_to(root):
             raise WorkspaceError(f"任务工作区越界: {ws_path}")
 
         # Git ref 不能同时存在 `agent/run-x` 和 `agent/run-x/...`，因此任务
         # 分支使用同级命名，而不是挂在 Run 分支 ref 下。
-        branch = f"agent/task-{run_slug}-{task_slug}-{batch_slug}"
+        branch = f"agent/task-{run_slug}-{task_slug}-{task_key}-{batch_slug}"
         if ws_path.exists():
             existing_branch = await worktree.head_branch(ws_path)
             if existing_branch == branch:

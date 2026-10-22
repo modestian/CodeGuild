@@ -286,6 +286,28 @@ class TestTaskWorkspaces:
         await manager.cleanup_task_workspace(run_path, Path(second.path))
         await manager.cleanup(str(sample_repo), run_path)
 
+    async def test_distinct_task_ids_with_same_slug_get_distinct_worktrees(
+        self, tmp_path, sample_repo
+    ):
+        manager = self._manager(tmp_path)
+        run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run133456789")
+        run_path = Path(run.path)
+
+        first = await manager.create_task_workspace(
+            run_path, run.branch, "run133456789", "batch-a", "API/Auth"
+        )
+        second = await manager.create_task_workspace(
+            run_path, run.branch, "run133456789", "batch-a", "API Auth"
+        )
+
+        try:
+            assert first.path != second.path
+            assert first.branch != second.branch
+        finally:
+            await manager.cleanup_task_workspace(run_path, Path(first.path))
+            await manager.cleanup_task_workspace(run_path, Path(second.path))
+            await manager.cleanup(str(sample_repo), run_path)
+
     async def test_task_commit_integrates_once(self, tmp_path, sample_repo):
         manager = self._manager(tmp_path)
         run = await manager.create_run_workspace(str(sample_repo), "noteapp", "run223456789")

@@ -414,6 +414,13 @@ class TestSelfCorrectionLoop:
         review_events = types.count(ET.REVIEW_RESULT.value)
         assert review_events >= 2
 
+        coder_session = app_ctx.sessions.load(run_id, f"{run_id}:coder:T1")
+        assert coder_session is not None
+        assert any(
+            "delete 未处理越界索引" in str(message.get("content") or "")
+            for message in coder_session.messages
+        ), "Review 修复反馈必须注入并行 Coding Worker 会话"
+
         # 修复后的代码包含越界检查
         core = (Path(run.workspace_path) / "noteapp" / "core.py").read_text(encoding="utf-8")
         assert "raise IndexError" in core

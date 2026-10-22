@@ -201,6 +201,17 @@ class _ControlledCodingGraph:
         return result
 
 
+class _RaisingCodingGraph:
+    def __init__(self):
+        self.calls = 0
+        self.workspaces: set[str] = set()
+
+    async def ainvoke(self, state: dict) -> dict:
+        self.calls += 1
+        self.workspaces.add(str(state["workspace_path"]))
+        raise RuntimeError("intentional worker crash")
+
+
 class TestParallelDevelopmentGraph:
     @staticmethod
     async def _state(app_ctx, sample_repo, tasks: list[TaskRecord], approval_mode: str = "auto"):
@@ -305,6 +316,36 @@ class TestParallelDevelopmentGraph:
                     )
             await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
 
+    async def test_terminal_failure_does_not_skip_later_independent_tasks(
+        self, app_ctx, sample_repo
+    ):
+        tasks = [_task("T1"), _task("T2"), _task("T3")]
+        state, run_ws = await self._state(app_ctx, sample_repo, tasks)
+        fake = _ControlledCodingGraph(
+            {"T1": "failed", "T2": "done", "T3": "done"}, parties=1
+        )
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            result = await graph.ainvoke(state)
+            statuses = {task["id"]: task["status"] for task in result["task_dag"]}
+
+            assert fake.started == ["T1", "T2", "T3"]
+            assert statuses == {
+                "T1": TaskStatus.FAILED.value,
+                "T2": TaskStatus.COMPLETED.value,
+                "T3": TaskStatus.COMPLETED.value,
+            }
+            assert result["needs_human"] is True
+            assert "MAX_CODE_RETRY" in result["fail_reason"]
+        finally:
+            for path in fake.workspaces.values():
+                if Path(path).exists():
+                    await app_ctx.workspaces.cleanup_task_workspace(
+                        Path(run_ws.path), Path(path)
+                    )
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
     async def test_interactive_mode_runs_ready_tasks_serially(self, app_ctx, sample_repo):
         tasks = [_task("T1"), _task("T2")]
         state, run_ws = await self._state(app_ctx, sample_repo, tasks, approval_mode="interactive")
@@ -345,6 +386,31 @@ class TestParallelDevelopmentGraph:
             app_ctx.settings.parallel_coding_enabled = previous
             for path in fake.workspaces.values():
                 if Path(path).exists() and Path(path) != Path(run_ws.path):
+                    await app_ctx.workspaces.cleanup_task_workspace(
+                        Path(run_ws.path), Path(path)
+                    )
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
+    async def test_worker_exceptions_consume_retry_budget(self, app_ctx, sample_repo):
+        state, run_ws = await self._state(app_ctx, sample_repo, [_task("T1")])
+        fake = _RaisingCodingGraph()
+        previous = app_ctx.settings.max_code_retry
+        app_ctx.settings.max_code_retry = 2
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            result = await graph.ainvoke(state, {"recursion_limit": 20})
+
+            task = next(item for item in result["task_dag"] if item["id"] == "T1")
+            assert fake.calls == 2
+            assert task["attempts"] == 2
+            assert task["status"] == TaskStatus.FAILED.value
+            assert result["needs_human"] is True
+            assert "MAX_CODE_RETRY=2" in result["fail_reason"]
+        finally:
+            app_ctx.settings.max_code_retry = previous
+            for path in fake.workspaces:
+                if Path(path).exists():
                     await app_ctx.workspaces.cleanup_task_workspace(
                         Path(run_ws.path), Path(path)
                     )
