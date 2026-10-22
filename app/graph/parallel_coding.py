@@ -56,6 +56,10 @@ def make_worker_state(
 ) -> dict:
     """复制父状态并替换所有会被 Coding SubGraph 修改的任务级字段。"""
     worker = copy.deepcopy(state)
+    worker_scratch: dict = {"batch_id": batch_id}
+    feedback = ((state.get("scratch") or {}).get("task_feedback") or {}).get(task_id)
+    if feedback:
+        worker_scratch["feedback"] = str(feedback)
     worker.update(
         {
             "active_task_id": task_id,
@@ -66,7 +70,7 @@ def make_worker_state(
             "validation": {},
             "plan": {},
             "plan_recorded": False,
-            "scratch": {"batch_id": batch_id},
+            "scratch": worker_scratch,
         }
     )
     return worker

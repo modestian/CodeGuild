@@ -1,6 +1,11 @@
 """并行 Coding 调度、Worker 隔离与 Development Graph 测试。"""
 from __future__ import annotations
 
+import asyncio
+import copy
+from pathlib import Path
+
+from app.graph.development_graph import build_development_graph
 from app.graph.parallel_coding import (
     make_worker_state,
     select_parallel_batch,
@@ -8,6 +13,8 @@ from app.graph.parallel_coding import (
     task_result_from_state,
 )
 from app.schemas.state import TaskRecord, TaskStatus, empty_dev_state
+from app.storage import repositories as repo
+from app.tools.common import run_host_git
 
 
 def _task(task_id: str, target_files: list[str] | None = None, attempts: int = 0) -> TaskRecord:
@@ -103,3 +110,242 @@ class TestWorkerStateBoundary:
             "validation": {"passed": True},
             "task": _task("T1", attempts=2).model_dump(mode="json"),
         }
+
+
+class _BarrierCodingGraph:
+    def __init__(self, parties: int = 2):
+        self.parties = parties
+        self.started: set[str] = set()
+        self.workspaces: dict[str, str] = {}
+        self.active = 0
+        self.max_active = 0
+        self.all_started = asyncio.Event()
+
+    async def ainvoke(self, state: dict) -> dict:
+        task_id = str(state["active_task_id"])
+        self.started.add(task_id)
+        self.workspaces[task_id] = str(state["workspace_path"])
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if len(self.started) >= self.parties:
+            self.all_started.set()
+        await asyncio.wait_for(self.all_started.wait(), timeout=3)
+        await asyncio.sleep(0.02)
+        result = copy.deepcopy(state)
+        result["scratch"]["coding_result"] = {
+            "status": "blocked",
+            "summary": "",
+            "notes": "intentional test stop",
+        }
+        result["validation"] = {"passed": False, "reason": "intentional test stop"}
+        for task in result["task_dag"]:
+            if task.get("id") == task_id:
+                task["status"] = TaskStatus.RUNNING.value
+                task["attempts"] = 99
+        self.active -= 1
+        return result
+
+
+class _ControlledCodingGraph:
+    def __init__(self, outcomes: dict[str, str], parties: int):
+        self.outcomes = outcomes
+        self.parties = parties
+        self.started: list[str] = []
+        self.workspaces: dict[str, str] = {}
+        self.active = 0
+        self.max_active = 0
+        self.ready = asyncio.Event()
+
+    async def ainvoke(self, state: dict) -> dict:
+        task_id = str(state["active_task_id"])
+        self.started.append(task_id)
+        self.workspaces[task_id] = str(state["workspace_path"])
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.active >= self.parties:
+            self.ready.set()
+        await asyncio.wait_for(self.ready.wait(), timeout=3)
+        result = copy.deepcopy(state)
+        task = next(item for item in result["task_dag"] if item.get("id") == task_id)
+        task["status"] = TaskStatus.RUNNING.value
+        if self.outcomes[task_id] == "done":
+            task["attempts"] = int(task.get("attempts") or 0) + 1
+            output = Path(result["workspace_path"]) / f"{task_id.lower()}.txt"
+            output.write_text(f"{task_id} done\n", encoding="utf-8")
+            result["changed_files"] = [
+                {"path": output.name, "action": "create", "task_id": task_id}
+            ]
+            result["scratch"]["coding_result"] = {
+                "status": "done",
+                "summary": f"{task_id} implemented",
+                "notes": "",
+            }
+            result["validation"] = {"passed": True}
+            result["scratch"]["validation"] = {"passed": True}
+        else:
+            task["attempts"] = 99
+            result["scratch"]["coding_result"] = {
+                "status": "blocked",
+                "summary": "",
+                "notes": f"{task_id} failed",
+            }
+            result["validation"] = {"passed": False, "reason": f"{task_id} failed"}
+            result["scratch"]["validation"] = {
+                "passed": False,
+                "reason": f"{task_id} failed",
+            }
+        await asyncio.sleep(0.02)
+        self.active -= 1
+        if self.active == 0:
+            self.ready.clear()
+        return result
+
+
+class TestParallelDevelopmentGraph:
+    @staticmethod
+    async def _state(app_ctx, sample_repo, tasks: list[TaskRecord], approval_mode: str = "auto"):
+        async with app_ctx.database.session() as session:
+            project = await repo.create_project(session, name="noteapp", repo_path=str(sample_repo))
+            run = await repo.create_run(
+                session, project.id, "parallel", approval_mode=approval_mode
+            )
+        run_ws = await app_ctx.workspaces.create_run_workspace(
+            str(sample_repo), "noteapp", run.id
+        )
+        async with app_ctx.database.session() as session:
+            await repo.sync_tasks(session, run.id, tasks)
+        state = empty_dev_state(project.id, run.id, "parallel")
+        state.update(
+            {
+                "workspace_path": run_ws.path,
+                "branch": run_ws.branch,
+                "task_dag": [task.model_dump(mode="json") for task in tasks],
+                "ready_tasks": [task.id for task in tasks if task.status == TaskStatus.READY],
+                "run_status": "running",
+            }
+        )
+        return state, run_ws
+
+    async def test_two_ready_tasks_overlap_in_distinct_worktrees(self, app_ctx, sample_repo):
+        async with app_ctx.database.session() as session:
+            project = await repo.create_project(session, name="noteapp", repo_path=str(sample_repo))
+            run = await repo.create_run(session, project.id, "parallel", approval_mode="auto")
+        run_ws = await app_ctx.workspaces.create_run_workspace(
+            str(sample_repo), "noteapp", run.id
+        )
+        tasks = [_task("T1"), _task("T2")]
+        async with app_ctx.database.session() as session:
+            await repo.sync_tasks(session, run.id, tasks)
+        state = empty_dev_state(project.id, run.id, "parallel")
+        state.update(
+            {
+                "workspace_path": run_ws.path,
+                "branch": run_ws.branch,
+                "task_dag": [task.model_dump(mode="json") for task in tasks],
+                "ready_tasks": ["T1", "T2"],
+                "run_status": "running",
+            }
+        )
+        fake = _BarrierCodingGraph()
+
+        try:
+            graph = build_development_graph(app_ctx, coding_graph=fake)
+            await graph.ainvoke(state)
+
+            assert fake.started == {"T1", "T2"}
+            assert fake.max_active == 2
+            assert len(set(fake.workspaces.values())) == 2
+            assert all(Path(path).exists() for path in fake.workspaces.values())
+        finally:
+            for path in fake.workspaces.values():
+                await app_ctx.workspaces.cleanup_task_workspace(Path(run_ws.path), Path(path))
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
+    async def test_integration_keeps_success_blocks_dependents_and_replays_once(
+        self, app_ctx, sample_repo
+    ):
+        tasks = [
+            _task("T1"),
+            _task("T2"),
+            TaskRecord(
+                id="T3",
+                title="T3",
+                dependencies=["T2"],
+                status=TaskStatus.PENDING,
+            ),
+        ]
+        state, run_ws = await self._state(app_ctx, sample_repo, tasks)
+        fake = _ControlledCodingGraph({"T1": "done", "T2": "failed"}, parties=2)
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            result = await graph.ainvoke(copy.deepcopy(state))
+            statuses = {task["id"]: task["status"] for task in result["task_dag"]}
+
+            assert fake.max_active == 2
+            assert statuses == {
+                "T1": TaskStatus.COMPLETED.value,
+                "T2": TaskStatus.FAILED.value,
+                "T3": TaskStatus.BLOCKED.value,
+            }
+            assert (Path(run_ws.path) / "t1.txt").read_text(encoding="utf-8") == "T1 done\n"
+            assert not (Path(run_ws.path) / "t2.txt").exists()
+
+            await graph.ainvoke(copy.deepcopy(state))
+            code, commits, _ = await run_host_git(
+                Path(run_ws.path), ["log", "--format=%H", "--grep", "feat(T1)"]
+            )
+            assert code == 0
+            assert len([line for line in commits.splitlines() if line.strip()]) == 1
+        finally:
+            for path in fake.workspaces.values():
+                if Path(path).exists():
+                    await app_ctx.workspaces.cleanup_task_workspace(
+                        Path(run_ws.path), Path(path)
+                    )
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
+    async def test_interactive_mode_runs_ready_tasks_serially(self, app_ctx, sample_repo):
+        tasks = [_task("T1"), _task("T2")]
+        state, run_ws = await self._state(app_ctx, sample_repo, tasks, approval_mode="interactive")
+        fake = _ControlledCodingGraph({"T1": "done", "T2": "failed"}, parties=1)
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            await graph.ainvoke(state)
+
+            assert fake.started == ["T1", "T2"]
+            assert fake.max_active == 1
+            assert set(fake.workspaces.values()) == {run_ws.path}
+        finally:
+            for path in fake.workspaces.values():
+                if Path(path).exists() and Path(path) != Path(run_ws.path):
+                    await app_ctx.workspaces.cleanup_task_workspace(
+                        Path(run_ws.path), Path(path)
+                    )
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
+    async def test_disabled_parallel_setting_uses_serial_compatibility_path(
+        self, app_ctx, sample_repo
+    ):
+        tasks = [_task("T1"), _task("T2")]
+        state, run_ws = await self._state(app_ctx, sample_repo, tasks, approval_mode="auto")
+        fake = _ControlledCodingGraph({"T1": "done", "T2": "failed"}, parties=1)
+        previous = app_ctx.settings.parallel_coding_enabled
+        app_ctx.settings.parallel_coding_enabled = False
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            await graph.ainvoke(state)
+
+            assert fake.started == ["T1", "T2"]
+            assert fake.max_active == 1
+            assert set(fake.workspaces.values()) == {run_ws.path}
+        finally:
+            app_ctx.settings.parallel_coding_enabled = previous
+            for path in fake.workspaces.values():
+                if Path(path).exists() and Path(path) != Path(run_ws.path):
+                    await app_ctx.workspaces.cleanup_task_workspace(
+                        Path(run_ws.path), Path(path)
+                    )
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))

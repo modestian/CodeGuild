@@ -11,19 +11,28 @@ Task Scheduler → Detect Ready Tasks → Coding Agents → Integration（V2）�
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
 from app.agents.base import dump_tasks, make_error, merged_errors, tasks_of
 from app.agents.reviewer import run_reviewer
 from app.agents.tester import run_tester
 from app.graph.coding_graph import build_coding_graph
+from app.graph.parallel_coding import (
+    make_worker_state,
+    select_parallel_batch,
+    stable_batch_id,
+    task_result_from_state,
+)
 from app.graph.routing import (
     DEV_ROUTES,
     route_after_finalize,
+    route_after_integration,
     route_after_repair,
     route_after_review,
-    route_after_scheduler,
     route_after_testing,
 )
 from app.graph.safe_point import pause_safe_point
@@ -70,9 +79,14 @@ def _compose_feedback(state: dict, stage: str) -> str:
     return "\n".join(lines)
 
 
-def build_development_graph(app: AppContext):
+def build_development_graph(app: AppContext, coding_graph: Any | None = None):
     """编译 Development SubGraph（含 Coding SubGraph 作为子节点）。"""
-    coding_graph = build_coding_graph(app)
+    injected_coding_worker = coding_graph is not None
+    coding_worker = coding_graph or build_coding_graph(app)
+
+    async def serial_code_node(state: dict) -> dict:
+        """Adapter used by deterministic test doubles that only expose ainvoke()."""
+        return await coding_worker.ainvoke(state)
 
     # =====================================================
     # Task Scheduler
@@ -121,8 +135,56 @@ def build_development_graph(app: AppContext):
                 state["run_id"], EventType.LOG, "All tasks completed. Running integration tests...", agent="scheduler"
             )
         elif ordered_ready:
-            scratch["dev_stage"] = "code"
-            updates["active_task_id"] = ordered_ready[0]
+            approval_mode = await app.approvals.mode_for(state["run_id"])
+            # The existing serial path is also the HITL compatibility boundary:
+            # Coding SubGraph must remain a real nested graph node so its interrupt()
+            # is checkpointed and resumed by the parent graph.  The parallel wrapper
+            # deliberately uses plain ainvoke(), which is only safe in auto mode.
+            parallel_allowed = (
+                app.settings.parallel_coding_enabled and approval_mode != "interactive"
+            )
+            limit = app.settings.max_parallel_coders if parallel_allowed else 1
+            batch = select_parallel_batch(tasks, ordered_ready, limit)
+            batch_id = stable_batch_id(state["run_id"], batch, tasks)
+            dispatches: list[dict] = []
+            if parallel_allowed:
+                scratch["dev_stage"] = "code"
+                for task_id in batch:
+                    workspace = await app.workspaces.create_task_workspace(
+                        Path(state["workspace_path"]),
+                        str(state.get("branch") or ""),
+                        state["run_id"],
+                        batch_id,
+                        task_id,
+                    )
+                    dispatches.append(
+                        {
+                            "task_id": task_id,
+                            "workspace_path": workspace.path,
+                            "branch": workspace.branch,
+                        }
+                    )
+                    await app.tracer.emit(
+                        state["run_id"],
+                        EventType.TASK_WORKSPACE_CREATED,
+                        f"Created isolated workspace for {task_id}.",
+                        agent="task_scheduler",
+                        data={"batch_id": batch_id, "task_id": task_id, "branch": workspace.branch},
+                    )
+            else:
+                scratch["dev_stage"] = "serial_code"
+            scratch["dispatches"] = dispatches
+            scratch["batch_id"] = batch_id
+            updates["active_batch_id"] = batch_id
+            updates["active_task_id"] = batch[0]
+            updates["current_tasks"] = batch
+            await app.tracer.emit(
+                state["run_id"],
+                EventType.BATCH_SCHEDULED,
+                f"Scheduled coding batch {batch_id}: {', '.join(batch)}.",
+                agent="task_scheduler",
+                data={"batch_id": batch_id, "task_ids": batch, "parallel": len(batch) > 1},
+            )
         elif blocked_left:
             scratch["dev_stage"] = "blocked"
             names = ", ".join(f"{t.id}({t.status.value})" for t in blocked_left[:8])
@@ -135,6 +197,208 @@ def build_development_graph(app: AppContext):
             updates["fail_reason"] = "无就绪任务且未全部完成（状态异常）"
             updates["errors"] = merged_errors(state, make_error("scheduler", updates["fail_reason"]))
         updates["scratch"] = scratch
+        return updates
+
+    def dispatch_after_scheduler(state: dict):
+        scratch = state.get("scratch") or {}
+        stage = scratch.get("dev_stage") or "blocked"
+        if stage != "code":
+            return stage
+        batch_id = str(state.get("active_batch_id") or scratch.get("batch_id") or "")
+        return [
+            Send(
+                "code_task",
+                make_worker_state(
+                    state,
+                    task_id=str(dispatch["task_id"]),
+                    batch_id=batch_id,
+                    workspace_path=str(dispatch["workspace_path"]),
+                    branch=str(dispatch["branch"]),
+                ),
+            )
+            for dispatch in (scratch.get("dispatches") or [])
+        ]
+
+    async def code_task_node(state: dict) -> dict:
+        """在隔离状态/工作区运行 Coding SubGraph，仅向父图追加任务结果。"""
+        task_id = str(state.get("active_task_id") or "")
+        try:
+            worker_state = await coding_worker.ainvoke(state)
+            result = task_result_from_state(worker_state)
+            if result.get("status") == "done":
+                commit = await app.workspaces.commit_task_workspace(
+                    Path(state["workspace_path"]), task_id, str(result.get("summary") or "")
+                )
+                result["commit_sha"] = commit["sha"]
+        except Exception as exc:  # noqa: BLE001 — 单 Worker 失败必须转换为批次结果
+            result = {
+                "batch_id": str((state.get("scratch") or {}).get("batch_id") or ""),
+                "task_id": task_id,
+                "status": "failed",
+                "summary": "",
+                "error": str(exc)[:1000],
+                "changed_files": [],
+                "validation": {},
+                "task": next(
+                    (
+                        dict(item)
+                        for item in (state.get("task_dag") or [])
+                        if isinstance(item, dict) and item.get("id") == task_id
+                    ),
+                    {},
+                ),
+            }
+        result["workspace_path"] = str(state.get("workspace_path") or "")
+        result["branch"] = str(state.get("branch") or "")
+        return {"coding_results": [result]}
+
+    async def integration_node(state: dict) -> dict:
+        """汇聚本批 Worker 结果，并作为共享任务状态的唯一写入边界。"""
+        tasks = tasks_of(state)
+        by_id = {task.id: task for task in tasks}
+        batch_id = str(state.get("active_batch_id") or "")
+        current_tasks = list(state.get("current_tasks") or [])
+        results = {
+            str(item.get("task_id") or ""): item
+            for item in (state.get("coding_results") or [])
+            if isinstance(item, dict) and str(item.get("batch_id") or "") == batch_id
+        }
+        topo = topological_order(tasks)
+        ordered = [task_id for task_id in topo if task_id in current_tasks]
+        completed = list(state.get("completed_tasks") or [])
+        changed_files = list(state.get("changed_files") or [])
+        integration_results: list[dict] = []
+        scratch = dict(state.get("scratch") or {})
+        task_feedback = dict(scratch.get("task_feedback") or {})
+        retry_count = int(state.get("retry_count") or 0)
+        terminal_failures: list[TaskRecord] = []
+
+        await app.tracer.emit(
+            state["run_id"],
+            EventType.INTEGRATION_STARTED,
+            f"Integrating coding batch {batch_id}.",
+            agent="integration",
+            data={"batch_id": batch_id, "task_ids": ordered},
+        )
+        for task_id in ordered:
+            task = by_id[task_id]
+            result = results.get(task_id) or {
+                "task_id": task_id,
+                "status": "failed",
+                "error": "Coding Worker 未返回结果",
+            }
+            worker_task = result.get("task") or {}
+            task.attempts = max(task.attempts, int(worker_task.get("attempts") or 0))
+            integration: dict[str, object]
+            if result.get("status") == "done" and result.get("commit_sha"):
+                integration = await app.workspaces.integrate_task_commit(
+                    Path(state["workspace_path"]), str(result["commit_sha"]), task_id
+                )
+            else:
+                integration = {
+                    "task_id": task_id,
+                    "integrated": False,
+                    "conflict": False,
+                    "error": str(result.get("error") or "Coding Worker 执行失败")[:1000],
+                }
+            integration_results.append(integration)
+
+            if integration.get("integrated"):
+                task.status = TaskStatus.COMPLETED
+                task.result_summary = str(result.get("summary") or "")[:500]
+                task.error = ""
+                completed.append(task_id)
+                task_feedback.pop(task_id, None)
+                existing = {
+                    (str(item.get("path") or ""), str(item.get("task_id") or ""))
+                    for item in changed_files
+                    if isinstance(item, dict)
+                }
+                for item in result.get("changed_files") or []:
+                    key = (str(item.get("path") or ""), str(item.get("task_id") or task_id))
+                    if key not in existing:
+                        changed_files.append(dict(item))
+                        existing.add(key)
+                await app.tracer.emit(
+                    state["run_id"],
+                    EventType.TASK_INTEGRATED,
+                    f"Integrated task {task_id}.",
+                    agent="integration",
+                    data={"batch_id": batch_id, **integration},
+                )
+                await app.tracer.emit(
+                    state["run_id"], EventType.TASK_COMPLETED, f"Task {task_id} completed.", agent="coder"
+                )
+                workspace_path = str(result.get("workspace_path") or "")
+                if workspace_path:
+                    await app.workspaces.cleanup_task_workspace(
+                        Path(state["workspace_path"]), Path(workspace_path)
+                    )
+            else:
+                reason = str(integration.get("error") or "任务集成失败")[:400]
+                task.error = reason
+                if task.attempts < app.settings.max_code_retry:
+                    task.status = TaskStatus.READY
+                    task_feedback[task_id] = reason
+                    retry_count += 1
+                    await app.tracer.emit(
+                        state["run_id"],
+                        EventType.REPAIRING,
+                        f"Repairing {task_id} (from code)...",
+                        agent="coder",
+                    )
+                else:
+                    task.status = TaskStatus.FAILED
+                    terminal_failures.append(task)
+                event_type = (
+                    EventType.INTEGRATION_CONFLICT
+                    if integration.get("conflict")
+                    else EventType.TASK_FAILED
+                )
+                await app.tracer.emit(
+                    state["run_id"],
+                    event_type,
+                    f"Task {task_id} not integrated: {reason[:160]}",
+                    agent="integration",
+                    data={"batch_id": batch_id, **integration},
+                )
+
+        tasks = propagate_blocking(tasks)
+        async with app.database.session() as session_db:
+            await repo.sync_tasks(session_db, state["run_id"], tasks)
+        scratch["task_feedback"] = task_feedback
+        scratch["dispatches"] = []
+        scratch["integration_route"] = "blocked" if terminal_failures else "schedule"
+        scratch["dev_stage"] = scratch["integration_route"]
+        await app.tracer.emit(
+            state["run_id"],
+            EventType.BATCH_COMPLETED,
+            f"Completed coding batch {batch_id}.",
+            agent="integration",
+            data={"batch_id": batch_id, "results": integration_results},
+        )
+        updates = {
+            "task_dag": dump_tasks(tasks),
+            "completed_tasks": list(dict.fromkeys(completed)),
+            "changed_files": changed_files,
+            "current_tasks": [],
+            "integration_results": integration_results,
+            "retry_count": retry_count,
+            "current_agent": "integration",
+            "scratch": scratch,
+        }
+        if terminal_failures:
+            failed_names = ", ".join(task.id for task in terminal_failures)
+            reason = (
+                f"任务 {failed_names} 达到 MAX_CODE_RETRY={app.settings.max_code_retry} 仍失败"
+            )
+            updates.update(
+                {
+                    "needs_human": True,
+                    "fail_reason": reason,
+                    "errors": merged_errors(state, make_error("coder", reason)),
+                }
+            )
         return updates
 
     # =====================================================
@@ -242,8 +506,8 @@ def build_development_graph(app: AppContext):
 
         target.status = TaskStatus.READY
         scratch["feedback"] = _compose_feedback(state, stage)
-        scratch["repair_route"] = "code"
-        scratch["dev_stage"] = "code"
+        scratch["repair_route"] = "schedule"
+        scratch["dev_stage"] = "schedule"
         scratch["active_task_id"] = target.id
         await app.tracer.emit(
             state["run_id"], EventType.REPAIRING, f"Repairing {target.id} (from {stage})...", agent="coder"
@@ -326,16 +590,23 @@ def build_development_graph(app: AppContext):
     routes = {**DEV_ROUTES, "done": END, "blocked": END}
     graph = StateGraph(DevState)
     graph.add_node("scheduler", scheduler_node)
-    graph.add_node("code_task", coding_graph)
+    graph.add_node(
+        "serial_code",
+        serial_code_node if injected_coding_worker else coding_worker,
+    )
+    graph.add_node("code_task", code_task_node)
+    graph.add_node("integration", integration_node)
     graph.add_node("finalize_task", finalize_task_node)
     graph.add_node("repair", repair_node)
     graph.add_node("testing", testing_node)
     graph.add_node("review", review_node)
 
     graph.add_edge(START, "scheduler")
-    graph.add_conditional_edges("scheduler", route_after_scheduler, routes)
-    graph.add_edge("code_task", "finalize_task")
+    graph.add_conditional_edges("scheduler", dispatch_after_scheduler, routes)
+    graph.add_edge("serial_code", "finalize_task")
+    graph.add_edge("code_task", "integration")
     graph.add_conditional_edges("finalize_task", route_after_finalize, routes)
+    graph.add_conditional_edges("integration", route_after_integration, routes)
     graph.add_conditional_edges("repair", route_after_repair, routes)
     graph.add_conditional_edges("testing", route_after_testing, routes)
     graph.add_conditional_edges("review", route_after_review, routes)

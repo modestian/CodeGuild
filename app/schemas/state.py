@@ -108,8 +108,10 @@ class DevState(TypedDict, total=False):
     plan: dict  # 当前 Coding Plan
     plan_recorded: bool
     active_task_id: str  # 当前正在编码的任务
+    active_batch_id: str  # 当前并行 Coding 批次
     pending_approvals: list  # 等待人工审批的工具调用
     coding_results: Annotated[list[dict], merge_task_results]  # 并行 Worker 的幂等结果集合
+    integration_results: list[dict]  # Integration 对任务提交的处理结果
     approval: dict  # 人工审批结果
     validation: dict  # 最近一次验证结果（编码子图内）
     final_report: dict  # Final Review 汇总
@@ -155,8 +157,10 @@ def empty_dev_state(project_id: str, run_id: str, user_request: str) -> DevState
         plan={},
         plan_recorded=False,
         active_task_id="",
+        active_batch_id="",
         pending_approvals=[],
         coding_results=[],
+        integration_results=[],
         approval={},
         validation={},
         final_report={},

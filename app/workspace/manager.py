@@ -317,18 +317,29 @@ class WorkspaceManager:
             files.append({"code": code_field, "path": path})
         return files
 
-    async def commit(self, workspace: Path, message: str, files: Optional[list[str]] = None) -> dict[str, str]:
+    async def commit(
+        self,
+        workspace: Path,
+        message: str,
+        files: Optional[list[str]] = None,
+        *,
+        allow_empty: bool = False,
+    ) -> dict[str, str]:
         if files:
             code, out, err = await run_host_git(workspace, ["add", "--", *files], timeout=60)
         else:
             code, out, err = await run_host_git(workspace, ["add", "-A"], timeout=60)
         if code != 0:
             raise WorkspaceError(f"git add 失败: {err.strip()[:300]}")
-        code, out, err = await run_host_git(
-            workspace,
-            ["-c", "user.name=Multi-Agent Copilot", "-c", "user.email=copilot@local", "commit", "-m", message],
-            timeout=60,
-        )
+        commit_args = [
+            "-c", "user.name=Multi-Agent Copilot",
+            "-c", "user.email=copilot@local",
+            "commit",
+        ]
+        if allow_empty:
+            commit_args.append("--allow-empty")
+        commit_args.extend(["-m", message])
+        code, out, err = await run_host_git(workspace, commit_args, timeout=60)
         if code != 0:
             raise WorkspaceError(f"git commit 失败: {(err or out).strip()[:500]}")
         code, sha, _ = await run_host_git(workspace, ["rev-parse", "--short", "HEAD"])
