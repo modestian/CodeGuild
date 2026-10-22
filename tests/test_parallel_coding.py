@@ -415,3 +415,35 @@ class TestParallelDevelopmentGraph:
                         Path(run_ws.path), Path(path)
                     )
             await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
+
+    async def test_cyclic_task_dag_stops_for_human_without_dispatching_workers(
+        self, app_ctx, sample_repo
+    ):
+        tasks = [
+            TaskRecord(
+                id="T1",
+                title="T1",
+                dependencies=["T2"],
+                status=TaskStatus.PENDING,
+            ),
+            TaskRecord(
+                id="T2",
+                title="T2",
+                dependencies=["T1"],
+                status=TaskStatus.PENDING,
+            ),
+        ]
+        state, run_ws = await self._state(app_ctx, sample_repo, tasks)
+        fake = _RaisingCodingGraph()
+        graph = build_development_graph(app_ctx, coding_graph=fake)
+
+        try:
+            result = await graph.ainvoke(state)
+
+            assert fake.calls == 0
+            assert result["needs_human"] is True
+            assert result["scratch"]["dev_stage"] == "blocked"
+            assert "Task DAG" in result["fail_reason"]
+            assert "循环依赖" in result["fail_reason"]
+        finally:
+            await app_ctx.workspaces.cleanup(str(sample_repo), Path(run_ws.path))
